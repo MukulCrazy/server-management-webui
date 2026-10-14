@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  server-manager:
+    build: .
+    image: server-manager-webui:latest
+    container_name: server-manager-webui
+    restart: unless-stopped
+    ports:
+      - "81:3000"
+    volumes:
+      - /home/ubuntu/docker/data:/app/data
+
+volumes:
+  server_data:
+    driver: local

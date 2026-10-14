@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Server Manager WebUI</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    body {
+      background-color: #121217;
+      color: #e1e1e6;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #mainContent {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .top-header {
+      background-color: #18181f;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #23232c;
+    }
+
+    .server-status-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 14px;
+    }
+
+    .badge-online {
+      color: #00e676;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .badge-online::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      background-color: #00e676;
+      border-radius: 50%;
+    }
+
+    .btn-disconnect {
+      background-color: #ff334b;
+      color: #fff;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .tab-btn {
+      background-color: #23232c;
+      color: #e1e1e6;
+      border: 1px solid #333342;
+      padding: 6px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    .tab-btn.active {
+      background-color: #0078d4;
+      border-color: #0078d4;
+      color: #ffffff;
+    }
+
+    /* Explorer Navigation and Action Toolbar */
+    .explorer-nav-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background-color: #1a1a22;
+      padding: 6px 14px;
+      border-bottom: 1px solid #23232c;
+    }
+
+    .nav-controls {
+      display: flex;
+      gap: 4px;
+    }
+
+    .nav-btn, .nav-home-btn {
+      background: transparent;
+      color: #cfd0d8;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      width: 32px;
+      height: 32px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .nav-btn:hover:not(:disabled), .nav-home-btn:hover {
+      background-color: #2b2b36;
+      border-color: #3f3f4e;
+    }
+
+    .nav-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .address-bar-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      background-color: #121217;
+      border: 1px solid #333342;
+      border-radius: 4px;
+      height: 34px;
+      padding: 0 8px;
+      overflow: hidden;
+    }
+
+    .address-bar-container:focus-within {
+      border-color: #0078d4;
+    }
+
+    .breadcrumb-list {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+      height: 100%;
+      cursor: text;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .crumb-item {
+      color: #e1e1e6;
+      font-size: 13px;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+
+    .crumb-item:hover {
+      background-color: #2b2b36;
+    }
+
+    .crumb-separator {
+      color: #717182;
+      font-size: 13px;
+    }
+
+    .manual-path-input {
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #ffffff;
+      font-size: 13px;
+      padding: 0 4px;
+    }
+
+    .search-bar-container {
+      width: 200px;
+    }
+
+    .search-input {
+      width: 100%;
+      height: 34px;
+      background-color: #121217;
+      border: 1px solid #333342;
+      border-radius: 4px;
+      padding: 0 10px;
+      color: #ffffff;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: #0078d4;
+    }
+
+    .file-actions-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .action-btn {
+      background-color: #0078d4;
+      color: #ffffff;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .action-btn.secondary {
+      background-color: #23232c;
+      border: 1px solid #333342;
+      color: #cfd0d8;
+    }
+
+    .action-btn:hover {
+      filter: brightness(1.15);
+    }
+
+    .view-container {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+    }
+
+    #terminalView {
+      width: 100%;
+      height: 100%;
+      background-color: #0a0a0e;
+      padding: 8px;
+      display: none;
+    }
+
+    #fileBrowserView {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      overflow-y: auto;
+    }
+
+    .file-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    .file-table th {
+      background-color: #16161c;
+      color: #8c8c9e;
+      font-weight: 500;
+      padding: 10px 14px;
+      border-bottom: 1px solid #23232c;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    .file-table td {
+      padding: 9px 14px;
+      border-bottom: 1px solid #1a1a22;
+      color: #cfd0d8;
+    }
+
+    .file-table tr:hover td {
+      background-color: #1c1c24;
+    }
+
+    .folder-link {
+      cursor: pointer;
+      color: #58a6ff;
+    }
+
+    .item-icon {
+      margin-right: 8px;
+    }
+
+    .row-btn {
+      background: transparent;
+      border: none;
+      color: #8c8c9e;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 2px 6px;
+    }
+
+    .row-btn:hover {
+      color: #ffffff;
+    }
+
+    #sidebar {
+      width: 280px;
+      background-color: #16161c;
+      border-left: 1px solid #23232c;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .sidebar-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid #23232c;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .sidebar-header h3 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8c8c9e;
+    }
+
+    .add-server-btn {
+      background-color: #0078d4;
+      color: #fff;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .server-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .server-card {
+      background-color: #1f1f28;
+      border: 1px solid #2d2d3a;
+      border-radius: 6px;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+
+    .server-card.active {
+      border-color: #0078d4;
+      background-color: #242432;
+    }
+
+    .server-card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+
+    .server-card-top h4 {
+      font-size: 14px;
+      color: #ffffff;
+    }
+
+    .badge-key {
+      font-size: 11px;
+      background: #2b2b36;
+      color: #8c8c9e;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+
+    .server-card-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .server-card-bottom p {
+      font-size: 12px;
+      color: #8c8c9e;
+    }
+
+    .card-edit-btn {
+      background: #2d2d3a;
+      color: #cfd0d8;
+      border: none;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+
+    .modal-card {
+      background-color: #1a1a22;
+      border: 1px solid #2d2d3a;
+      border-radius: 6px;
+      width: 440px;
+      max-height: 90vh;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    .modal-card h3 {
+      margin-bottom: 14px;
+      font-size: 16px;
+    }
+
+    .form-group {
+      margin-bottom: 12px;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: #8c8c9e;
+      margin-bottom: 4px;
+    }
+
+    .form-group input, .form-group select, .form-group textarea {
+      width: 100%;
+      background-color: #121217;
+      border: 1px solid #333342;
+      border-radius: 4px;
+      padding: 8px 10px;
+      color: #ffffff;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .file-grab-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 18px;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="mainContent">
+    <div class="top-header">
+      <div class="server-status-info">
+        <strong id="activeServerName">Select a Server</strong>
+        <span id="activeServerHost" style="color: #8c8c9e;">--</span>
+        <span id="activeStatusBadge" class="badge-online" style="display: none;">Online / Active</span>
+        <button id="disconnectServerBtn" class="btn-disconnect" style="display: none;">Disconnect</button>
+      </div>
+      <div class="header-actions">
+        <button id="viewTerminalBtn" class="tab-btn">Terminal</button>
+        <button id="viewFilesBtn" class="tab-btn active">File Browser</button>
+      </div>
+    </div>
+
+    <div class="explorer-nav-bar" id="explorerBar">
+      <div class="nav-controls">
+        <button id="navBackBtn" class="nav-btn" title="Back" disabled>&#8592;</button>
+        <button id="navForwardBtn" class="nav-btn" title="Forward" disabled>&#8594;</button>
+        <button id="navUpBtn" class="nav-btn" title="Up">&#8593;</button>
+        <button id="navRefreshBtn" class="nav-btn" title="Refresh">&#8635;</button>
+      </div>
+
+      <div class="address-bar-container">
+        <button id="navHomeBtn" class="nav-home-btn" title="Home">&#8962;</button>
+        <div id="breadcrumbList" class="breadcrumb-list"></div>
+        <input type="text" id="manualPathInput" class="manual-path-input" style="display: none;" spellcheck="false" />
+      </div>
+
+      <div class="search-bar-container">
+        <input type="text" id="fileSearchInput" class="search-input" placeholder="Search current folder" />
+      </div>
+
+      <div class="file-actions-group">
+        <button id="newFileBtn" class="action-btn secondary">+ File</button>
+        <button id="newFolderBtn" class="action-btn secondary">+ Folder</button>
+        <button id="uploadTriggerBtn" class="action-btn">Upload</button>
+        <input type="file" id="fileUploadInput" style="display: none;" />
+      </div>
+    </div>
+
+    <div class="view-container">
+      <div id="fileBrowserView">
+        <table class="file-table" id="fileListTable">
+          <thead>
+            <tr>
+              <th style="width: 32px;"><input type="checkbox" id="selectAllCheckbox" /></th>
+              <th>Name</th>
+              <th>Size</th>
+              <th>Modified</th>
+              <th>Mode</th>
+              <th style="width: 80px; text-align: center;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="fileTableBody">
+            <tr>
+              <td colspan="6" style="text-align: center; color: #8c8c9e; padding: 24px;">Select a server from the sidebar to browse files</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div id="terminalView"></div>
+    </div>
+  </div>
+
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <h3>List of Servers</h3>
+      <button class="add-server-btn" id="openAddServerModal">+ Add Server</button>
+    </div>
+    <div class="server-list" id="serversContainer"></div>
+  </div>
+
+  <!-- Server Modal with Private Key Picker -->
+  <div class="modal-overlay" id="serverModal">
+    <div class="modal-card">
+      <h3 id="modalTitle">Add Server</h3>
+      <input type="hidden" id="editServerId" />
+      <div class="form-group">
+        <label>Server Name</label>
+        <input type="text" id="srvName" placeholder="My Ubuntu Server" />
+      </div>
+      <div class="form-group">
+        <label>Host / IP</label>
+        <input type="text" id="srvHost" placeholder="130.210.38.78" />
+      </div>
+      <div class="form-group">
+        <label>Port</label>
+        <input type="number" id="srvPort" value="22" />
+      </div>
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="srvUser" value="ubuntu" />
+      </div>
+      <div class="form-group">
+        <label>Authentication</label>
+        <select id="srvAuthType">
+          <option value="key">SSH Private Key</option>
+          <option value="password">Password</option>
+        </select>
+      </div>
+      <div class="form-group" id="passField" style="display: none;">
+        <label>Password</label>
+        <input type="password" id="srvPass" placeholder="Enter password" />
+      </div>
+      <div class="form-group" id="keyField">
+        <label>SSH Private Key</label>
+        <textarea id="srvKey" rows="5" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+        <div class="file-grab-row">
+          <button type="button" class="action-btn secondary" id="browseKeyBtn">Browse Private Key File</button>
+          <input type="file" id="srvKeyFileInput" style="display: none;" />
+          <span id="keyFileName" style="font-size: 12px; color: #8c8c9e;">No file chosen</span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-disconnect" id="deleteServerBtn" style="display: none;">Delete</button>
+        <div style="display: flex; gap: 8px; margin-left: auto;">
+          <button class="action-btn secondary" id="closeServerModal">Cancel</button>
+          <button class="action-btn" id="saveServerBtn">Save Server</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
