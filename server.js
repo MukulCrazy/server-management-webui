@@ -1,319 +1,525 @@
 const express = require('express');
 const http = require('http');
-const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
-const { Client } = require('ssh2');
 const WebSocket = require('ws');
+const { Client } = require('ssh2');
+const fs = require('fs');
+const path = require('path');
+const archiver = require('archiver');
+const unzipper = require('unzipper');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
+const KEYS_DIR = path.join(DATA_DIR, 'keys');
 const SERVERS_FILE = path.join(DATA_DIR, 'servers.json');
-const TEMP_DIR = path.join(DATA_DIR, 'temp');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+if (!fs.existsSync(KEYS_DIR)) fs.mkdirSync(KEYS_DIR, { recursive: true });
 
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
-}
-
-if (!fs.existsSync(SERVERS_FILE)) {
-  fs.writeFileSync(SERVERS_FILE, JSON.stringify([], null, 2));
-}
-
-const upload = multer({ dest: TEMP_DIR });
-
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-function readServers() {
+function getServers() {
+  if (!fs.existsSync(SERVERS_FILE)) return [];
   try {
-    const raw = fs.readFileSync(SERVERS_FILE, 'utf-8');
-    return JSON.parse(raw);
-  } catch (err) {
+    return JSON.parse(fs.readFileSync(SERVERS_FILE, 'utf8'));
+  } catch {
     return [];
   }
 }
 
-function writeServers(data) {
-  fs.writeFileSync(SERVERS_FILE, JSON.stringify(data, null, 2));
+function saveServers(servers) {
+  fs.writeFileSync(SERVERS_FILE, JSON.stringify(servers, null, 2), 'utf8');
 }
 
-function getSftpClient(srv, callback) {
-  const conn = new Client();
-  conn.on('ready', () => {
-    conn.sftp((err, sftp) => {
-      if (err) {
-        conn.end();
-        return callback(err);
-      }
-      callback(null, sftp, conn);
-    });
-  }).on('error', (err) => {
-    callback(err);
-  }).connect({
-    host: srv.host,
-    port: parseInt(srv.port, 10) || 22,
-    username: srv.username || 'ubuntu',
-    password: srv.authType === 'password' ? srv.password : undefined,
-    privateKey: srv.authType === 'key' ? srv.privateKey : undefined,
+function buildConfig(s) {
+  const config = {
+    host: s.host,
+    port: parseInt(s.port, 10) || 22,
+    username: s.username,
     readyTimeout: 10000
+  };
+  if (s.privateKey) {
+    config.privateKey = s.privateKey.trim();
+  } else if (s.password) {
+    config.password = s.password;
+  }
+  return config;
+}
+
+const terminalSessions = new Map();
+const sftpClients = new Map();
+
+function getSFTP(serverConfig, cb) {
+  const cached = sftpClients.get(serverConfig.id);
+  if (cached && cached.sftp) return cb(null, cached.sftp);
+
+  const client = new Client();
+  client.on('ready', () => {
+    client.sftp((err, sftp) => {
+      if (err) {
+        client.end();
+        return cb(err);
+      }
+      sftpClients.set(serverConfig.id, { client, sftp });
+      cb(null, sftp);
+    });
+  });
+  client.on('error', (err) => {
+    sftpClients.delete(serverConfig.id);
+    cb(err);
+  });
+  client.on('end', () => sftpClients.delete(serverConfig.id));
+  client.on('close', () => sftpClients.delete(serverConfig.id));
+
+  try {
+    client.connect(buildConfig(serverConfig));
+  } catch (err) {
+    cb(err);
+  }
+}
+
+// Recursive deletion for files and non-empty folders
+function rmrf(sftp, targetPath, cb) {
+  sftp.stat(targetPath, (err, stats) => {
+    if (err) return cb(err);
+    if (!stats.isDirectory()) {
+      return sftp.unlink(targetPath, cb);
+    }
+    sftp.readdir(targetPath, (readErr, list) => {
+      if (readErr) return cb(readErr);
+      if (list.length === 0) {
+        return sftp.rmdir(targetPath, cb);
+      }
+      let remaining = list.length;
+      let firstError = null;
+      for (const item of list) {
+        const fullChild = path.posix.join(targetPath, item.filename);
+        rmrf(sftp, fullChild, (childErr) => {
+          if (childErr && !firstError) firstError = childErr;
+          remaining--;
+          if (remaining === 0) {
+            if (firstError) return cb(firstError);
+            sftp.rmdir(targetPath, cb);
+          }
+        });
+      }
+    });
   });
 }
 
-// Server CRUD endpoints
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: '100mb' }));
+
+// Stream upload directly to remote SFTP
+app.post('/api/files/upload', (req, res) => {
+  const { serverId, targetPath } = req.query;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !targetPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const wStream = sftp.createWriteStream(targetPath);
+    req.pipe(wStream);
+
+    wStream.on('close', () => res.json({ success: true }));
+    wStream.on('error', (writeErr) => {
+      if (!res.headersSent) res.status(500).json({ error: writeErr.message });
+    });
+  });
+});
+
 app.get('/api/servers', (req, res) => {
-  res.json(readServers());
+  const list = getServers().map(({ password, privateKey, ...s }) => ({
+    ...s,
+    authType: privateKey ? 'SSH Key' : (password ? 'Password' : 'None')
+  }));
+  res.json(list);
 });
 
 app.post('/api/servers', (req, res) => {
-  const servers = readServers();
-  const newServer = {
-    id: Date.now().toString(),
-    name: req.body.name || 'Server',
-    host: req.body.host,
-    port: parseInt(req.body.port, 10) || 22,
-    username: req.body.username || 'ubuntu',
-    authType: req.body.authType || 'key',
-    password: req.body.password || '',
-    privateKey: req.body.privateKey || ''
-  };
-  servers.push(newServer);
-  writeServers(servers);
-  res.status(201).json(newServer);
+  const { name, host, port, username, authType, password, privateKey } = req.body;
+  if (!name || !host || !username) {
+    return res.status(400).json({ error: 'Missing required parameters' });
+  }
+
+  const servers = getServers();
+  const id = Date.now().toString();
+  servers.push({
+    id,
+    name,
+    host,
+    port: parseInt(port, 10) || 22,
+    username,
+    authType: authType || 'password',
+    password: authType === 'password' ? password : null,
+    privateKey: authType === 'key' ? privateKey : null
+  });
+  saveServers(servers);
+  res.json({ success: true, id });
 });
 
 app.put('/api/servers/:id', (req, res) => {
-  let servers = readServers();
+  const { name, host, port, username, authType, password, privateKey } = req.body;
+  const servers = getServers();
   const idx = servers.findIndex((s) => s.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'Server not found' });
 
   servers[idx] = {
     ...servers[idx],
-    name: req.body.name || servers[idx].name,
-    host: req.body.host || servers[idx].host,
-    port: parseInt(req.body.port, 10) || servers[idx].port,
-    username: req.body.username || servers[idx].username,
-    authType: req.body.authType || servers[idx].authType,
-    password: req.body.password !== undefined ? req.body.password : servers[idx].password,
-    privateKey: req.body.privateKey !== undefined ? req.body.privateKey : servers[idx].privateKey
+    name,
+    host,
+    port: parseInt(port, 10) || 22,
+    username,
+    authType: authType || 'password',
+    password: authType === 'password' ? password : null,
+    privateKey: authType === 'key' ? (privateKey || servers[idx].privateKey) : null
   };
-  writeServers(servers);
-  res.json(servers[idx]);
-});
-
-app.delete('/api/servers/:id', (req, res) => {
-  let servers = readServers();
-  servers = servers.filter((s) => s.id !== req.params.id);
-  writeServers(servers);
+  saveServers(servers);
   res.json({ success: true });
 });
 
-// SFTP directory listing
-app.post('/api/sftp/list', (req, res) => {
-  const { serverId, dirPath } = req.body;
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) return res.status(404).json({ error: 'Server not found' });
+app.delete('/api/servers/:id', (req, res) => {
+  const sess = terminalSessions.get(req.params.id);
+  if (sess) {
+    try { sess.client.end(); } catch (e) {}
+    terminalSessions.delete(req.params.id);
+  }
+  const sftp = sftpClients.get(req.params.id);
+  if (sftp) {
+    try { sftp.client.end(); } catch (e) {}
+    sftpClients.delete(req.params.id);
+  }
+  saveServers(getServers().filter((s) => s.id !== req.params.id));
+  res.json({ success: true });
+});
 
-  getSftpClient(srv, (err, sftp, conn) => {
+app.post('/api/sftp/disconnect', (req, res) => {
+  const { serverId } = req.body;
+  const sftpObj = sftpClients.get(serverId);
+  if (sftpObj) {
+    try { sftpObj.client.end(); } catch (e) {}
+    sftpClients.delete(serverId);
+  }
+  res.json({ success: true });
+});
+
+app.get('/api/files', (req, res) => {
+  const { serverId, dirPath } = req.query;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s) return res.status(404).json({ error: 'Server not configured' });
+
+  getSFTP(s, (err, sftp) => {
     if (err) return res.status(500).json({ error: err.message });
+    const targetDir = (dirPath && dirPath.trim()) || (s.username === 'root' ? '/root' : `/home/${s.username}`);
 
-    sftp.readdir(dirPath || '/', (readErr, list) => {
-      conn.end();
+    sftp.readdir(targetDir, (readErr, list) => {
       if (readErr) return res.status(500).json({ error: readErr.message });
+      const items = list
+        .map((item) => ({
+          name: item.filename,
+          isDir: item.attrs.isDirectory(),
+          size: item.attrs.size,
+          mtime: item.attrs.mtime * 1000,
+          permission: (item.attrs.mode & 0o777).toString(8) || '755'
+        }))
+        .sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name));
 
-      const items = list.map((item) => ({
-        name: item.filename,
-        isDirectory: item.attrs.isDirectory(),
-        size: item.attrs.size,
-        modified: new Date(item.attrs.mtime * 1000).toLocaleString(),
-        mode: (item.attrs.mode & 0o777).toString(8)
-      }));
-
-      items.sort((a, b) => {
-        if (a.isDirectory === b.isDirectory) return a.name.localeCompare(b.name);
-        return a.isDirectory ? -1 : 1;
-      });
-
-      res.json({ files: items, currentPath: dirPath || '/' });
+      res.json({ currentPath: targetDir, files: items });
     });
   });
 });
 
-// SFTP upload
-app.post('/api/sftp/upload', upload.single('file'), (req, res) => {
-  const { serverId, targetDir } = req.body;
-  if (!req.file) return res.status(400).json({ error: 'No file provided' });
+app.get('/api/files/read', (req, res) => {
+  const { serverId, filePath } = req.query;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !filePath) return res.status(400).json({ error: 'Invalid arguments' });
 
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) {
-    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    return res.status(404).json({ error: 'Server not found' });
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    sftp.stat(filePath, (statErr, stats) => {
+      if (statErr) return res.status(500).json({ error: statErr.message });
+      if (stats.size > 5 * 1024 * 1024) {
+        return res.status(400).json({ error: 'File is too large to edit directly' });
+      }
+
+      const stream = sftp.createReadStream(filePath);
+      let content = '';
+      stream.on('data', (d) => { content += d.toString('utf8'); });
+      stream.on('end', () => {
+        const mode = (stats.mode & 0o777).toString(8);
+        res.json({ content, mode, size: stats.size });
+      });
+      stream.on('error', (e) => res.status(500).json({ error: e.message }));
+    });
+  });
+});
+
+app.post('/api/files/save', (req, res) => {
+  const { serverId, filePath, content } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !filePath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const wStream = sftp.createWriteStream(filePath);
+    wStream.on('close', () => res.json({ success: true }));
+    wStream.on('error', (writeErr) => res.status(500).json({ error: writeErr.message }));
+    wStream.end(content, 'utf8');
+  });
+});
+
+app.post('/api/files/touch', (req, res) => {
+  const { serverId, targetPath } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !targetPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const wStream = sftp.createWriteStream(targetPath);
+    wStream.on('close', () => res.json({ success: true }));
+    wStream.on('error', (writeErr) => res.status(500).json({ error: writeErr.message }));
+    wStream.end('');
+  });
+});
+
+app.post('/api/files/unzip', (req, res) => {
+  const { serverId, zipPath, targetDir } = req.body;
+  const s = getServers().find(x => x.id === serverId);
+  if (!s || !zipPath || !targetDir) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const rStream = sftp.createReadStream(zipPath);
+    let activePipes = 0;
+    let streamClosed = false;
+
+    function checkFinished() {
+      if (streamClosed && activePipes === 0 && !res.headersSent) {
+        res.json({ success: true });
+      }
+    }
+
+    rStream
+      .pipe(unzipper.Parse())
+      .on('entry', (entry) => {
+        const destPath = path.posix.join(targetDir, entry.path);
+        if (entry.type === 'Directory') {
+          sftp.mkdir(destPath, () => entry.autodrain());
+        } else {
+          activePipes++;
+          const wStream = sftp.createWriteStream(destPath);
+          entry.pipe(wStream);
+          wStream.on('close', () => {
+            activePipes--;
+            checkFinished();
+          });
+          wStream.on('error', () => {
+            activePipes--;
+            checkFinished();
+          });
+        }
+      })
+      .on('close', () => {
+        streamClosed = true;
+        checkFinished();
+      })
+      .on('error', (uErr) => {
+        if (!res.headersSent) res.status(500).json({ error: uErr.message });
+      });
+  });
+});
+
+app.get('/api/files/download', (req, res) => {
+  const { serverId, filePath } = req.query;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !filePath) return res.status(400).send('Invalid arguments');
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).send(err.message);
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    sftp.createReadStream(filePath).pipe(res);
+  });
+});
+
+app.post('/api/files/download-zip', (req, res) => {
+  const { serverId, paths } = req.body;
+  const s = getServers().find(x => x.id === serverId);
+  if (!s || !Array.isArray(paths) || paths.length === 0) return res.status(400).send('Invalid request');
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).send(err.message);
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    res.setHeader('Content-Disposition', `attachment; filename="archive_${Date.now()}.zip"`);
+    res.setHeader('Content-Type', 'application/zip');
+    archive.pipe(res);
+
+    for (const target of paths) {
+      const stream = sftp.createReadStream(target);
+      archive.append(stream, { name: path.basename(target) });
+    }
+    archive.finalize();
+  });
+});
+
+// Recursive delete endpoint for single and batch deletions
+app.post('/api/files/delete', (req, res) => {
+  const { serverId, targetPath } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !targetPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+    rmrf(sftp, targetPath, (delErr) => {
+      if (delErr) return res.status(500).json({ error: delErr.message });
+      res.json({ success: true });
+    });
+  });
+});
+
+app.post('/api/files/rename', (req, res) => {
+  const { serverId, oldPath, newPath } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !oldPath || !newPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+    sftp.rename(oldPath, newPath, (rErr) => {
+      if (rErr) return res.status(500).json({ error: rErr.message });
+      res.json({ success: true });
+    });
+  });
+});
+
+app.post('/api/files/copy', (req, res) => {
+  const { serverId, srcPath, destPath } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !srcPath || !destPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const rStream = sftp.createReadStream(srcPath);
+    const wStream = sftp.createWriteStream(destPath);
+    rStream.pipe(wStream);
+    wStream.on('close', () => res.json({ success: true }));
+    wStream.on('error', (err) => res.status(500).json({ error: err.message }));
+  });
+});
+
+app.post('/api/files/mkdir', (req, res) => {
+  const { serverId, targetPath } = req.body;
+  const s = getServers().find((x) => x.id === serverId);
+  if (!s || !targetPath) return res.status(400).json({ error: 'Missing parameters' });
+
+  getSFTP(s, (err, sftp) => {
+    if (err) return res.status(500).json({ error: err.message });
+    sftp.mkdir(targetPath, (mErr) => {
+      if (mErr) return res.status(500).json({ error: mErr.message });
+      res.json({ success: true });
+    });
+  });
+});
+
+// Terminal Connection
+wss.on('connection', (ws, req) => {
+  const urlParams = new URLSearchParams(req.url.replace('/?', ''));
+  const serverId = urlParams.get('serverId');
+  const serverConfig = getServers().find((s) => s.id === serverId);
+
+  if (!serverConfig) {
+    ws.send('\r\n[Error: Server not found]\r\n');
+    return ws.close();
   }
 
-  getSftpClient(srv, (err, sftp, conn) => {
-    if (err) {
-      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      return res.status(500).json({ error: err.message });
-    }
+  let session = terminalSessions.get(serverId);
 
-    const destinationPath = path.posix.join(targetDir || '/home/ubuntu', req.file.originalname);
-    sftp.fastPut(req.file.path, destinationPath, (uploadErr) => {
-      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-      conn.end();
-      if (uploadErr) return res.status(500).json({ error: uploadErr.message });
-      res.json({ success: true, path: destinationPath });
-    });
-  });
-});
-
-// SFTP folder creation
-app.post('/api/sftp/mkdir', (req, res) => {
-  const { serverId, dirPath } = req.body;
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) return res.status(404).json({ error: 'Server not found' });
-
-  getSftpClient(srv, (err, sftp, conn) => {
-    if (err) return res.status(500).json({ error: err.message });
-    sftp.mkdir(dirPath, (mkdirErr) => {
-      conn.end();
-      if (mkdirErr) return res.status(500).json({ error: mkdirErr.message });
-      res.json({ success: true });
-    });
-  });
-});
-
-// SFTP file creation
-app.post('/api/sftp/create-file', (req, res) => {
-  const { serverId, filePath } = req.body;
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) return res.status(404).json({ error: 'Server not found' });
-
-  getSftpClient(srv, (err, sftp, conn) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const writeStream = sftp.createWriteStream(filePath);
-    writeStream.on('close', () => {
-      conn.end();
-      res.json({ success: true });
-    });
-    writeStream.on('error', (streamErr) => {
-      conn.end();
-      res.status(500).json({ error: streamErr.message });
-    });
-    writeStream.end('');
-  });
-});
-
-// SFTP delete item
-app.post('/api/sftp/delete', (req, res) => {
-  const { serverId, itemPath, isDirectory } = req.body;
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) return res.status(404).json({ error: 'Server not found' });
-
-  getSftpClient(srv, (err, sftp, conn) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const removeMethod = isDirectory ? sftp.rmdir.bind(sftp) : sftp.unlink.bind(sftp);
-    removeMethod(itemPath, (removeErr) => {
-      conn.end();
-      if (removeErr) return res.status(500).json({ error: removeErr.message });
-      res.json({ success: true });
-    });
-  });
-});
-
-// SFTP download item
-app.get('/api/sftp/download', (req, res) => {
-  const { serverId, filePath } = req.query;
-  const servers = readServers();
-  const srv = servers.find((s) => s.id === serverId);
-  if (!srv) return res.status(404).json({ error: 'Server not found' });
-
-  getSftpClient(srv, (err, sftp, conn) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const fileName = path.posix.basename(filePath);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    const readStream = sftp.createReadStream(filePath);
-    readStream.pipe(res);
-    readStream.on('close', () => conn.end());
-    readStream.on('error', (streamErr) => {
-      conn.end();
-      if (!res.headersSent) res.status(500).json({ error: streamErr.message });
-    });
-  });
-});
-
-// Terminal WebSocket handler
-wss.on('connection', (ws) => {
-  let conn = null;
-  let stream = null;
-
-  ws.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
-
-      if (data.type === 'init') {
-        const servers = readServers();
-        const srv = servers.find((s) => s.id === data.serverId);
-        if (!srv) {
-          ws.send(JSON.stringify({ type: 'output', data: '\r\nServer not found.\r\n' }));
+  if (session && session.active) {
+    session.ws = ws;
+    if (session.scrollback.length > 0) ws.send(session.scrollback);
+    ws.on('message', (msg) => {
+      const str = msg.toString();
+      try {
+        const parsed = JSON.parse(str);
+        if (parsed.type === 'resize' && session.stream) {
+          session.stream.setWindow(parsed.rows, parsed.cols, 0, 0);
           return;
         }
+      } catch (e) {}
+      if (session.stream && session.active) session.stream.write(str);
+    });
+    ws.on('close', () => {
+      if (session.ws === ws) session.ws = null;
+    });
+    return;
+  }
 
-        conn = new Client();
-        conn.on('ready', () => {
-          conn.shell({ term: 'xterm-256color', rows: data.rows || 24, cols: data.cols || 80 }, (err, s) => {
-            if (err) {
-              ws.send(JSON.stringify({ type: 'output', data: `\r\nShell error: ${err.message}\r\n` }));
-              return;
-            }
-            stream = s;
-            stream.on('data', (chunk) => {
-              ws.send(JSON.stringify({ type: 'output', data: chunk.toString('utf-8') }));
-            });
-            stream.on('close', () => {
-              conn.end();
-              ws.close();
-            });
-          });
-        }).on('error', (err) => {
-          ws.send(JSON.stringify({ type: 'output', data: `\r\nConnection error: ${err.message}\r\n` }));
-        }).connect({
-          host: srv.host,
-          port: parseInt(srv.port, 10) || 22,
-          username: srv.username || 'ubuntu',
-          password: srv.authType === 'password' ? srv.password : undefined,
-          privateKey: srv.authType === 'key' ? srv.privateKey : undefined
-        });
-      }
+  const client = new Client();
+  session = { client, stream: null, scrollback: '', active: false, ws };
+  terminalSessions.set(serverId, session);
 
-      if (data.type === 'input' && stream) {
-        stream.write(data.data);
+  client.on('ready', () => {
+    client.shell({ term: 'xterm-256color', rows: 30, cols: 100 }, (err, stream) => {
+      if (err) {
+        terminalSessions.delete(serverId);
+        return ws.close();
       }
+      session.stream = stream;
+      session.active = true;
 
-      if (data.type === 'resize' && stream) {
-        stream.setWindow(data.rows, data.cols, 0, 0);
-      }
-    } catch (e) {
-      // Ignore malformed packets
+      stream.on('data', (d) => {
+        const text = d.toString('utf-8');
+        session.scrollback += text;
+        if (session.scrollback.length > 200000) session.scrollback = session.scrollback.slice(-120000);
+        if (session.ws && session.ws.readyState === WebSocket.OPEN) session.ws.send(text);
+      });
+
+      stream.on('close', () => {
+        session.active = false;
+        client.end();
+        terminalSessions.delete(serverId);
+        if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+          session.ws.send('\r\n\x1b[33m[Session ended: Terminal process terminated]\x1b[0m\r\n');
+          session.ws.close(1000, 'process_exit');
+        }
+      });
+
+      ws.on('message', (msg) => {
+        const str = msg.toString();
+        try {
+          const parsed = JSON.parse(str);
+          if (parsed.type === 'resize' && session.stream) {
+            session.stream.setWindow(parsed.rows, parsed.cols, 0, 0);
+            return;
+          }
+        } catch (e) {}
+        if (session.stream && session.active) session.stream.write(str);
+      });
+      ws.on('close', () => {
+        if (session.ws === ws) session.ws = null;
+      });
+    });
+  });
+
+  client.on('error', (err) => {
+    terminalSessions.delete(serverId);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(`\r\n[SSH Error: ${err.message}]\r\n`);
+      ws.close();
     }
   });
 
-  ws.on('close', () => {
-    if (conn) conn.end();
-  });
+  try {
+    client.connect(buildConfig(serverConfig));
+  } catch (err) {
+    terminalSessions.delete(serverId);
+    ws.send(`\r\n[SSH Error: ${err.message}]\r\n`);
+    ws.close();
+  }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server manager listening on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => console.log(`Server manager active at http://localhost:${PORT}`));

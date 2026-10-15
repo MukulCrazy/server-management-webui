@@ -1,15 +1,11 @@
 {
   "name": "server-management-webui",
   "version": "1.0.0",
-  "description": "ssh terminal and file browser on the go web",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "dependencies": {
+    "archiver": "^7.0.1",
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1",
     "ssh2": "^1.15.0",
-    "ws": "^8.17.0"
+    "unzipper": "^0.12.5",
+    "ws": "^8.16.0"
   }
 }

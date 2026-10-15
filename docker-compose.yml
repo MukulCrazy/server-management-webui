@@ -10,7 +10,3 @@ services:
       - "81:3000"
     volumes:
       - /home/ubuntu/docker/data:/app/data
-
-volumes:
-  server_data:
-    driver: local
